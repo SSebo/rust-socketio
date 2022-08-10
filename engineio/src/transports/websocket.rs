@@ -47,15 +47,23 @@ impl WebsocketTransport {
 impl Transport for WebsocketTransport {
     fn emit(&self, data: Bytes, is_binary_att: bool) -> Result<()> {
         self.runtime.block_on(async {
+            println!("emit will get lock");
             let lock = self.inner.lock().await;
-            lock.emit(data, is_binary_att).await
+            println!("emit did get lock");
+            let r = lock.emit(data, is_binary_att).await;
+            println!("emit free lock");
+            r
         })
     }
 
     fn poll(&self) -> Result<Bytes> {
         self.runtime.block_on(async {
+            println!("wait lock");
             let mut lock = self.inner.lock().await;
-            lock.next().await.ok_or(Error::IncompletePacket())?
+            println!("got lock");
+            let r = lock.next().await.ok_or(Error::IncompletePacket())?;
+            println!("free lock");
+            r
         })
     }
 
