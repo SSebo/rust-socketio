@@ -44,5 +44,14 @@ fn main() {
 
     // use the socket
 
-    socket.disconnect().expect("Disconnect failed")
+    let join_handle = std::thread::spawn(move || loop {
+        println!("{:?} will emit", std::time::Instant::now());
+        let r = socket.emit("message", json!("test"));
+        println!("{:?} did emit {:?} ", std::time::Instant::now(), r);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    });
+
+    let _ = join_handle.join();
+
+    // socket.disconnect().expect("Disconnect failed")
 }
