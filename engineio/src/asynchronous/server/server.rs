@@ -90,6 +90,7 @@ impl Server {
         peer_addr: &SocketAddr,
         ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
     ) -> Result<()> {
+        println!("store_stream {}", sid);
         let (sender, receiver) = ws_stream.split();
         // SAFETY: url is valid to parse
         let url = Url::parse(&format!("http://{}", peer_addr)).unwrap();

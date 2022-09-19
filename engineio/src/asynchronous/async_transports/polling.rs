@@ -2,17 +2,20 @@ use adler32::adler32;
 use async_stream::try_stream;
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
-use futures_util::{Stream, StreamExt};
+use futures_util::{ready, FutureExt, Stream, StreamExt};
 use http::HeaderMap;
 use native_tls::TlsConnector;
 use reqwest::{Client, ClientBuilder, Response};
 use std::fmt::Debug;
-use std::time::SystemTime;
 use std::{pin::Pin, sync::Arc};
-use tokio::sync::RwLock;
+use std::{task::Poll, time::SystemTime};
+use tokio::sync::{
+    mpsc::{Receiver, Sender},
+    Mutex, RwLock,
+};
 use url::Url;
 
-use crate::asynchronous::generator::StreamGenerator;
+use crate::{asynchronous::generator::StreamGenerator, Packet, PacketId};
 use crate::{asynchronous::transport::AsyncTransport, error::Result, Error};
 
 /// An asynchronous polling type. Makes use of the nonblocking reqwest types and
@@ -154,6 +157,85 @@ impl Debug for PollingTransport {
             .field("client", &self.client)
             .field("base_url", &self.base_url)
             .finish()
+    }
+}
+
+pub struct ServerPollingTransport {
+    sender: Mutex<Sender<Bytes>>,
+    receiver: Mutex<Receiver<Bytes>>,
+    url: Mutex<Url>,
+}
+
+impl ServerPollingTransport {
+    fn new(url: Url, buffer_size: usize, sender: Sender<Bytes>, receiver: Receiver<Bytes>) -> Self {
+        // let (tx, rx) = channel(buffer_size);
+        Self {
+            url: Mutex::new(url),
+            sender: Mutex::new(sender),
+            receiver: Mutex::new(receiver),
+        }
+    }
+}
+
+#[async_trait]
+impl AsyncTransport for ServerPollingTransport {
+    async fn emit(&self, data: Bytes, is_binary_att: bool) -> Result<()> {
+        let data_to_send = if is_binary_att {
+            // the binary attachment gets `base64` encoded
+            let mut packet_bytes = BytesMut::with_capacity(data.len() + 1);
+            packet_bytes.put_u8(b'b');
+
+            let encoded_data = base64::encode(data);
+            packet_bytes.put(encoded_data.as_bytes());
+
+            packet_bytes.freeze()
+        } else {
+            data
+        };
+        let mut send_buffer = self.sender.lock().await;
+        send_buffer.send(data_to_send).await;
+        Ok(())
+    }
+
+    async fn base_url(&self) -> Result<Url> {
+        let url = self.url.lock().await;
+        return Ok(url.clone());
+    }
+
+    async fn set_base_url(&self, base_url: Url) -> Result<()> {
+        let mut url = self.url.lock().await;
+        *url = base_url;
+        Ok(())
+    }
+}
+
+impl Stream for ServerPollingTransport {
+    type Item = Result<Bytes>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        loop {
+            let mut lock = ready!(Box::pin(self.recv_buffer.lock()).poll_unpin(cx));
+            let next = lock.pop_front();
+            match next {
+                Some(packet) if packet.packet_id == PacketId::Message => {
+                    return Poll::Ready(Some(Ok(packet.data)))
+                }
+                Some(packet) if packet.packet_id == PacketId::MessageBinary => {
+                    let data = packet.data;
+                    let mut msg = BytesMut::with_capacity(data.len() + 1);
+                    msg.put_u8(PacketId::Message as u8);
+                    msg.put(data.as_ref());
+
+                    return Poll::Ready(Some(Ok(msg.freeze())));
+                }
+                // ignore packets other than text and binary
+                Some(_) => (),
+                None => return Poll::Ready(None),
+            }
+        }
     }
 }
 

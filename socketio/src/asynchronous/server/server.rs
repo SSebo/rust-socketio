@@ -165,9 +165,11 @@ impl Server {
     }
 
     async fn create_client(self: &Arc<Self>, sid: Sid) {
+        println!("create_client {}", sid);
         if let Some(engine_client) = self.engine_server.client(&sid).await {
             let mut socket = Socket::new_server(engine_client);
             let next = socket.next().await;
+            println!("handle connect packet {:?}", next);
             // TODO: support multiple namespace
             // first packet should be Connect
             if let Some(Ok(packet)) = next {
@@ -197,15 +199,19 @@ impl Server {
 
                 poll_client(client.clone());
 
-                let _ = client
-                    .emit(Event::Connect, json!({ "sid": sid.clone() }))
-                    .await;
-
-                let mut clients = self.clients.write().await;
-                let mut ns_clients = HashMap::new();
-                ns_clients.insert(nsp, client);
-                clients.insert(sid, ns_clients);
+                if client
+                    .handshake(json!({ "sid": sid.clone() }).to_string())
+                    .await
+                    .is_ok()
+                {
+                    let mut clients = self.clients.write().await;
+                    let mut ns_clients = HashMap::new();
+                    ns_clients.insert(nsp, client);
+                    clients.insert(sid, ns_clients);
+                }
             }
+        } else {
+            println!(">>> here")
         }
     }
 

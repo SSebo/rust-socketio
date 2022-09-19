@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use futures_util::future::poll_fn;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use http::Response;
 use httparse::{Request, Status, EMPTY_HEADER};
 use reqwest::Url;
@@ -20,8 +20,6 @@ use super::{Server, Sid};
 const MAX_BUFF_LEN: usize = 1024;
 /// Limit for the number of header lines.
 const MAX_HEADERS: usize = 124;
-const PING_PROBE: &str = "2probe";
-const PONG: &str = "3";
 
 #[derive(Default)]
 pub(crate) struct SidGenerator {
@@ -69,6 +67,7 @@ impl WebsocketAcceptor {
         stream: MaybeTlsStream<TcpStream>,
         addr: &SocketAddr,
     ) -> Result<()> {
+        println!("accept websocket {:?}", sid);
         let mut ws_stream = accept_async(stream).await?;
         let sid = match sid {
             // websocket connecting directly, instead of upgrading from polling
@@ -76,32 +75,10 @@ impl WebsocketAcceptor {
             Some(sid) => sid,
         };
 
-        if let Some(Ok(Message::Text(msg))) = ws_stream.next().await {
-            match msg.as_str() {
-                // upgrade from polling
-                PING_PROBE => {
-                    send_pong_probe(&mut ws_stream).await?;
-                    server.store_stream(sid, addr, ws_stream).await?;
-                }
-                // websocket connecting directly
-                PONG => {
-                    server.store_stream(sid, addr, ws_stream).await?;
-                }
-                _ => {}
-            }
-        }
+        server.store_stream(sid, addr, ws_stream).await?;
 
         Ok(())
     }
-}
-
-async fn send_pong_probe(ws_stream: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) -> Result<()> {
-    let packet = Bytes::from(Packet::new(PacketId::Pong, Bytes::from("probe")));
-    let pong_probe = from_utf8(&packet).unwrap();
-    ws_stream
-        .send(Message::text(Cow::Borrowed(pong_probe)))
-        .await?;
-    Ok(())
 }
 
 async fn handshake(
