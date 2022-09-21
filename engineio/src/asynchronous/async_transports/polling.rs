@@ -15,19 +15,91 @@ use tokio::sync::{
 };
 use url::Url;
 
-use crate::{asynchronous::generator::StreamGenerator, Packet, PacketId};
+use crate::asynchronous::generator::StreamGenerator;
 use crate::{asynchronous::transport::AsyncTransport, error::Result, Error};
+
+#[derive(Clone, Debug)]
+enum PollingEnd {
+    Client(ClientPolling),
+    Server(ServerPolling),
+}
 
 /// An asynchronous polling type. Makes use of the nonblocking reqwest types and
 /// methods.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PollingTransport {
+    inner: PollingEnd,
+}
+
+impl PollingTransport {
+    pub fn new(
+        base_url: Url,
+        tls_config: Option<TlsConnector>,
+        opening_headers: Option<HeaderMap>,
+    ) -> Self {
+        Self {
+            inner: PollingEnd::Client(ClientPolling::new(base_url, tls_config, opening_headers)),
+        }
+    }
+
+    pub fn server_new(url: Url, sender: Sender<Bytes>, receiver: Receiver<Bytes>) -> Self {
+        Self {
+            inner: PollingEnd::Server(ServerPolling::new(url, sender, receiver)),
+        }
+    }
+}
+
+impl Stream for PollingTransport {
+    type Item = Result<Bytes>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match &mut self.inner {
+            PollingEnd::Client(client) => client.poll_next_unpin(cx),
+            PollingEnd::Server(server) => server.poll_next_unpin(cx),
+        }
+    }
+}
+
+#[async_trait]
+impl AsyncTransport for PollingTransport {
+    /// Sends a packet to the server. This optionally handles sending of a
+    /// socketio binary attachment via the boolean attribute `is_binary_att`.
+    async fn emit(&self, data: Bytes, is_binary_att: bool) -> Result<()> {
+        match &self.inner {
+            PollingEnd::Client(client) => client.emit(data, is_binary_att).await,
+            PollingEnd::Server(server) => server.emit(data, is_binary_att).await,
+        }
+    }
+
+    /// Returns start of the url. ex. http://localhost:2998/engine.io/?EIO=4&transport=polling
+    /// Must have EIO and transport already set.
+    async fn base_url(&self) -> Result<Url> {
+        match &self.inner {
+            PollingEnd::Client(client) => client.base_url().await,
+            PollingEnd::Server(server) => server.base_url().await,
+        }
+    }
+
+    /// Used to update the base path, like when adding the sid.
+    async fn set_base_url(&self, base_url: Url) -> Result<()> {
+        match &self.inner {
+            PollingEnd::Client(client) => client.set_base_url(base_url).await,
+            PollingEnd::Server(server) => server.set_base_url(base_url).await,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ClientPolling {
     client: Client,
     base_url: Arc<RwLock<Url>>,
     generator: StreamGenerator<Bytes>,
 }
 
-impl PollingTransport {
+impl ClientPolling {
     pub fn new(
         base_url: Url,
         tls_config: Option<TlsConnector>,
@@ -50,7 +122,7 @@ impl PollingTransport {
         let mut url = base_url;
         url.query_pairs_mut().append_pair("transport", "polling");
 
-        PollingTransport {
+        ClientPolling {
             client: client.clone(),
             base_url: Arc::new(RwLock::new(url.clone())),
             generator: StreamGenerator::new(Self::stream(url, client)),
@@ -90,7 +162,7 @@ impl PollingTransport {
     }
 }
 
-impl Stream for PollingTransport {
+impl Stream for ClientPolling {
     type Item = Result<Bytes>;
 
     fn poll_next(
@@ -102,7 +174,7 @@ impl Stream for PollingTransport {
 }
 
 #[async_trait]
-impl AsyncTransport for PollingTransport {
+impl AsyncTransport for ClientPolling {
     async fn emit(&self, data: Bytes, is_binary_att: bool) -> Result<()> {
         let data_to_send = if is_binary_att {
             // the binary attachment gets `base64` encoded
@@ -151,7 +223,7 @@ impl AsyncTransport for PollingTransport {
     }
 }
 
-impl Debug for PollingTransport {
+impl Debug for ClientPolling {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PollingTransport")
             .field("client", &self.client)
@@ -160,25 +232,26 @@ impl Debug for PollingTransport {
     }
 }
 
-pub struct ServerPollingTransport {
-    sender: Mutex<Sender<Bytes>>,
-    receiver: Mutex<Receiver<Bytes>>,
-    url: Mutex<Url>,
+#[derive(Clone, Debug)]
+pub struct ServerPolling {
+    sender: Arc<Mutex<Sender<Bytes>>>,
+    receiver: Arc<Mutex<Receiver<Bytes>>>,
+    url: Arc<Mutex<Url>>,
 }
 
-impl ServerPollingTransport {
-    fn new(url: Url, buffer_size: usize, sender: Sender<Bytes>, receiver: Receiver<Bytes>) -> Self {
+impl ServerPolling {
+    fn new(url: Url, sender: Sender<Bytes>, receiver: Receiver<Bytes>) -> Self {
         // let (tx, rx) = channel(buffer_size);
         Self {
-            url: Mutex::new(url),
-            sender: Mutex::new(sender),
-            receiver: Mutex::new(receiver),
+            url: Arc::new(Mutex::new(url)),
+            sender: Arc::new(Mutex::new(sender)),
+            receiver: Arc::new(Mutex::new(receiver)),
         }
     }
 }
 
 #[async_trait]
-impl AsyncTransport for ServerPollingTransport {
+impl AsyncTransport for ServerPolling {
     async fn emit(&self, data: Bytes, is_binary_att: bool) -> Result<()> {
         let data_to_send = if is_binary_att {
             // the binary attachment gets `base64` encoded
@@ -192,8 +265,11 @@ impl AsyncTransport for ServerPollingTransport {
         } else {
             data
         };
-        let mut send_buffer = self.sender.lock().await;
-        send_buffer.send(data_to_send).await;
+        let sender = self.sender.lock().await;
+        sender
+            .send(data_to_send)
+            .await
+            .map_err(|e| Error::FailedToEmit(e.to_string()))?;
         Ok(())
     }
 
@@ -209,38 +285,28 @@ impl AsyncTransport for ServerPollingTransport {
     }
 }
 
-impl Stream for ServerPollingTransport {
+impl Stream for ServerPolling {
     type Item = Result<Bytes>;
 
     fn poll_next(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        loop {
-            let mut lock = ready!(Box::pin(self.recv_buffer.lock()).poll_unpin(cx));
-            let next = lock.pop_front();
-            match next {
-                Some(packet) if packet.packet_id == PacketId::Message => {
-                    return Poll::Ready(Some(Ok(packet.data)))
-                }
-                Some(packet) if packet.packet_id == PacketId::MessageBinary => {
-                    let data = packet.data;
-                    let mut msg = BytesMut::with_capacity(data.len() + 1);
-                    msg.put_u8(PacketId::Message as u8);
-                    msg.put(data.as_ref());
+        let mut lock = ready!(Box::pin(self.receiver.lock()).poll_unpin(cx));
+        let recv = ready!(Box::pin(lock.recv()).poll_unpin(cx));
+        drop(lock);
 
-                    return Poll::Ready(Some(Ok(msg.freeze())));
-                }
-                // ignore packets other than text and binary
-                Some(_) => (),
-                None => return Poll::Ready(None),
-            }
+        match recv {
+            Some(bytes) => Poll::Ready(Some(Ok(bytes))),
+            None => Poll::Ready(None),
         }
     }
 }
 
 #[cfg(test)]
 mod test {
+    use tokio::sync::mpsc::channel;
+
     use crate::asynchronous::transport::AsyncTransport;
 
     use super::*;
@@ -271,6 +337,34 @@ mod test {
             "http://127.0.0.1/?transport=polling"
         );
         assert_ne!(transport.base_url().await?.to_string(), url);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_polling_transport() -> Result<()> {
+        let url = Url::parse("http://127.0.0.1/?transport=polling").unwrap();
+        let (send_tx, mut send_rx) = channel(100);
+        let (recv_tx, recv_rx) = channel(100);
+        let mut transport = ServerPolling::new(url, send_tx, recv_rx);
+
+        let data = Bytes::from_static(b"1Hello\x1e1HelloWorld");
+
+        recv_tx.send(data.clone()).await.unwrap();
+
+        let msg = transport.next().await;
+        assert!(msg.is_some());
+        let msg = msg.unwrap();
+        assert!(msg.is_ok());
+        let msg = msg.unwrap();
+
+        assert_eq!(msg, data);
+
+        transport.emit(data.clone(), false).await?;
+        let msg = send_rx.recv().await;
+        assert!(msg.is_some());
+        let msg = msg.unwrap();
+        assert_eq!(msg, data);
+
         Ok(())
     }
 }

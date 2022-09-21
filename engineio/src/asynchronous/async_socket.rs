@@ -123,7 +123,7 @@ impl Socket {
             PacketId::Ping => {
                 self.pinged().await;
                 // server and pong timeout test case should not pong
-                if self.should_pong || packet.data == *"probe" {
+                if self.should_pong {
                     self.emit(Packet::new(PacketId::Pong, packet.data)).await?;
                 }
             }

@@ -2,15 +2,19 @@ extern crate base64;
 use base64::{decode, encode};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::char;
-use std::convert::TryFrom;
 use std::convert::TryInto;
 use std::ops::Index;
+use std::{char, collections::VecDeque};
+use std::{convert::TryFrom, str::from_utf8};
 
 use crate::{
     asynchronous::server::Sid,
     error::{Error, Result},
 };
+
+// see https://en.wikipedia.org/wiki/Delimiter#ASCII_delimited_text
+const SEPARATOR: char = '\x1e';
+
 /// Enumeration of the `engine.io` `Packet` types.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum PacketId {
@@ -155,9 +159,6 @@ impl From<Packet> for Bytes {
 pub(crate) struct Payload(Vec<Packet>);
 
 impl Payload {
-    // see https://en.wikipedia.org/wiki/Delimiter#ASCII_delimited_text
-    const SEPARATOR: char = '\x1e';
-
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.0.len()
@@ -173,7 +174,7 @@ impl TryFrom<Bytes> for Payload {
         let mut last_index = 0;
 
         for i in 0..payload.len() {
-            if *payload.get(i).unwrap() as char == Self::SEPARATOR {
+            if *payload.get(i).unwrap() as char == SEPARATOR {
                 vec.push(Packet::try_from(payload.slice(last_index..i))?);
                 last_index = i + 1;
             }
@@ -195,7 +196,7 @@ impl TryFrom<Payload> for Bytes {
         for packet in packets {
             // at the moment no base64 encoding is used
             buf.extend(Bytes::from(packet.clone()));
-            buf.put_u8(Payload::SEPARATOR as u8);
+            buf.put_u8(SEPARATOR as u8);
         }
 
         // remove the last separator
@@ -230,6 +231,26 @@ impl Index<usize> for Payload {
     type Output = Packet;
     fn index(&self, index: usize) -> &Packet {
         &self.0[index]
+    }
+}
+
+pub fn build_polling_payload(mut byte_vec: VecDeque<Bytes>) -> Option<String> {
+    let mut payload = String::new();
+    while let Some(bytes) = byte_vec.pop_front() {
+        if *bytes.get(0)? == b'b' {
+            payload.push_str(&encode(bytes));
+        } else if let Ok(s) = from_utf8(&bytes) {
+            payload.push_str(s);
+        }
+
+        if !byte_vec.is_empty() {
+            payload.push(SEPARATOR);
+        }
+    }
+    if payload.is_empty() {
+        None
+    } else {
+        Some(payload)
     }
 }
 

@@ -7,8 +7,8 @@ const { Manager } = require("socket.io-client");
 
 
 // const manager = new Manager("http://127.0.0.1:4209", { transports: ["websocket"] });
-const manager = new Manager("http://127.0.0.1:4200");
-// const manager = new Manager("http://127.0.0.1:4209");
+// const manager = new Manager("http://127.0.0.1:4200");
+const manager = new Manager("http://127.0.0.1:4209");
 
 // const socket = manager.socket("/"); // main namespace
 const socket = manager.socket("/admin");

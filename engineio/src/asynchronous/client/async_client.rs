@@ -47,7 +47,6 @@ impl Client {
 
     /// Sends a packet to the server.
     pub async fn emit(&self, packet: Packet) -> Result<()> {
-        println!("engineio emit >>> {:?}", packet);
         self.socket.emit(packet).await
     }
 
