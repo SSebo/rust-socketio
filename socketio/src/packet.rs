@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use crate::Error::{InvalidJson, InvalidUtf8};
 use bytes::{BufMut, Bytes, BytesMut};
-use regex::Regex;
+use serde_json::Value;
 use std::convert::TryFrom;
 
 /// An enumeration of the different `Packet` types in the `socket.io` protocol.
@@ -21,7 +21,7 @@ pub enum PacketId {
 pub struct Packet {
     pub packet_type: PacketId,
     pub nsp: String,
-    pub data: Option<String>,
+    pub data: Option<Value>,
     pub id: Option<i32>,
     pub attachment_count: u8,
     pub attachments: Option<Vec<Bytes>>,
@@ -68,7 +68,7 @@ impl Packet {
     pub const fn new(
         packet_type: PacketId,
         nsp: String,
-        data: Option<String>,
+        data: Option<Value>,
         id: Option<i32>,
         attachment_count: u8,
         attachments: Option<Vec<Bytes>>,
@@ -119,9 +119,9 @@ impl From<&Packet> for Bytes {
         let mut buffer = BytesMut::new();
         buffer.put(string.as_ref());
 
-        if let Some(data) = packet.data.as_ref() {
-            buffer.put(data.as_ref());
-        }
+        // SAFETY:
+        let data = serde_json::to_string(&packet.data).unwrap();
+        buffer.put(data.as_ref());
 
         buffer.freeze()
     }
@@ -218,27 +218,12 @@ impl TryFrom<&Bytes> for Packet {
 
         // data
         let json_str: String = utf8_iter.into_iter().collect();
-        let json_data: serde_json::Value = serde_json::from_str(&json_str).map_err(InvalidJson)?;
+        let json_data: Value = serde_json::from_str(&json_str).map_err(InvalidJson)?;
 
-        match packet.packet_type {
-            PacketId::BinaryAck | PacketId::BinaryEvent => {
-                let re_close = Regex::new(r",]$|]$").unwrap();
-                let mut str = json_data
-                    .to_string()
-                    .replace("{\"_placeholder\":true,\"num\":0}", "");
-
-                if str.starts_with('[') {
-                    str.remove(0);
-                }
-                str = re_close.replace(&str, "").to_string();
-
-                if str.is_empty() {
-                    packet.data = None
-                } else {
-                    packet.data = Some(str)
-                }
-            }
-            _ => packet.data = Some(json_data.to_string()),
+        packet.data = match json_data {
+            Value::Array(vec) if vec.is_empty() => None,
+            Value::Array(vec) if vec.len() == 1 => vec.get(0).map(|v| v.to_owned()),
+            _ => Some(json_data),
         };
 
         Ok(packet)
@@ -248,6 +233,7 @@ impl TryFrom<&Bytes> for Packet {
 #[cfg(test)]
 mod test {
     use super::*;
+    use serde_json::json;
 
     #[test]
     /// This test suite is taken from the explanation section here:
@@ -261,7 +247,7 @@ mod test {
             Packet::new(
                 PacketId::Connect,
                 "/".to_owned(),
-                Some(String::from("{\"token\":\"123\"}")),
+                Some(json!({"token": "123"})),
                 None,
                 0,
                 None,
@@ -269,8 +255,8 @@ mod test {
             packet.unwrap()
         );
 
-        let utf8_data = "{\"token™\":\"123\"}".to_owned();
-        let utf8_payload = format!("0/admin™,{}", utf8_data);
+        let utf8_data = Some(json!({"token™":"123"}));
+        let utf8_payload = format!("0/admin™,{}", serde_json::to_string(&utf8_data).unwrap());
         let payload = Bytes::from(utf8_payload);
         let packet = Packet::try_from(&payload);
         assert!(packet.is_ok());
@@ -279,7 +265,7 @@ mod test {
             Packet::new(
                 PacketId::Connect,
                 "/admin™".to_owned(),
-                Some(utf8_data),
+                utf8_data,
                 None,
                 0,
                 None,
@@ -311,7 +297,7 @@ mod test {
             Packet::new(
                 PacketId::Event,
                 "/".to_owned(),
-                Some(String::from("[\"hello\",1]")),
+                Some(json!(["hello", 1])),
                 None,
                 0,
                 None,
@@ -327,7 +313,7 @@ mod test {
             Packet::new(
                 PacketId::Event,
                 "/admin".to_owned(),
-                Some(String::from("[\"project:delete\",123]")),
+                Some(json!(["project:delete", 123])),
                 Some(456),
                 0,
                 None,
@@ -340,14 +326,7 @@ mod test {
         assert!(packet.is_ok());
 
         assert_eq!(
-            Packet::new(
-                PacketId::Ack,
-                "/admin".to_owned(),
-                Some(String::from("[]")),
-                Some(456),
-                0,
-                None,
-            ),
+            Packet::new(PacketId::Ack, "/admin".to_owned(), None, Some(456), 0, None,),
             packet.unwrap()
         );
 
@@ -359,7 +338,7 @@ mod test {
             Packet::new(
                 PacketId::ConnectError,
                 "/admin".to_owned(),
-                Some(String::from("{\"message\":\"Not authorized\"}")),
+                Some(json!({"message":"Not authorized"})),
                 None,
                 0,
                 None,
@@ -375,10 +354,10 @@ mod test {
             Packet::new(
                 PacketId::BinaryEvent,
                 "/".to_owned(),
-                Some(String::from("\"hello\"")),
+                Some(json!(["hello", {"_placeholder": true, "num":0}])),
                 None,
                 1,
-                None,
+                None
             ),
             packet.unwrap()
         );
@@ -393,7 +372,7 @@ mod test {
             Packet::new(
                 PacketId::BinaryEvent,
                 "/admin".to_owned(),
-                Some(String::from("\"project:delete\"")),
+                Some(json!(["project:delete", {"_placeholder": true, "num":0}])),
                 Some(456),
                 1,
                 None,
@@ -409,7 +388,7 @@ mod test {
             Packet::new(
                 PacketId::BinaryAck,
                 "/admin".to_owned(),
-                None,
+                Some(json!({"_placeholder": true, "num": 0})),
                 Some(456),
                 1,
                 None,
@@ -425,7 +404,7 @@ mod test {
         let packet = Packet::new(
             PacketId::Connect,
             "/".to_owned(),
-            Some(String::from("{\"token\":\"123\"}")),
+            Some(json!({"token": "123"})),
             None,
             0,
             None,
@@ -439,7 +418,7 @@ mod test {
         let packet = Packet::new(
             PacketId::Connect,
             "/admin".to_owned(),
-            Some(String::from("{\"token\":\"123\"}")),
+            Some(json!({"token": "123"})),
             None,
             0,
             None,
@@ -464,7 +443,7 @@ mod test {
         let packet = Packet::new(
             PacketId::Event,
             "/".to_owned(),
-            Some(String::from("[\"hello\",1]")),
+            Some(json!(["hello", 1])),
             None,
             0,
             None,
@@ -478,7 +457,7 @@ mod test {
         let packet = Packet::new(
             PacketId::Event,
             "/admin".to_owned(),
-            Some(String::from("[\"project:delete\",123]")),
+            Some(json!(["project:delete", 123])),
             Some(456),
             0,
             None,
@@ -491,14 +470,7 @@ mod test {
                 .into_bytes()
         );
 
-        let packet = Packet::new(
-            PacketId::Ack,
-            "/admin".to_owned(),
-            Some(String::from("[]")),
-            Some(456),
-            0,
-            None,
-        );
+        let packet = Packet::new(PacketId::Ack, "/admin".to_owned(), None, Some(456), 0, None);
 
         assert_eq!(
             Bytes::from(&packet),
@@ -508,7 +480,7 @@ mod test {
         let packet = Packet::new(
             PacketId::ConnectError,
             "/admin".to_owned(),
-            Some(String::from("{\"message\":\"Not authorized\"}")),
+            Some(json!(["message", "Not authorized"])),
             None,
             0,
             None,
@@ -524,9 +496,7 @@ mod test {
         let packet = Packet::new(
             PacketId::BinaryEvent,
             "/".to_owned(),
-            Some(String::from(
-                "[\"hello\",{\"_placeholder\":true,\"num\":0}]",
-            )),
+            Some(json!(["hello", {"_placeholder": true, "num": 0}])),
             None,
             1,
             Some(vec![Bytes::from_static(&[1, 2, 3])]),
@@ -542,9 +512,7 @@ mod test {
         let packet = Packet::new(
             PacketId::BinaryEvent,
             "/admin".to_owned(),
-            Some(String::from(
-                "[\"project:delete\",{\"_placeholder\":true,\"num\":0}]",
-            )),
+            Some(json!(["project:delete", {"_placeholder": true, "num": 0}])),
             Some(456),
             1,
             Some(vec![Bytes::from_static(&[1, 2, 3])]),
@@ -560,7 +528,7 @@ mod test {
         let packet = Packet::new(
             PacketId::BinaryAck,
             "/admin".to_owned(),
-            Some(String::from("[{\"_placeholder\":true,\"num\":0}]")),
+            Some(json!([{"_placeholder": true, "num": 0}])),
             Some(456),
             1,
             Some(vec![Bytes::from_static(&[3, 2, 1])]),
@@ -569,6 +537,27 @@ mod test {
         assert_eq!(
             Bytes::from(&packet),
             "61-/admin,456[{\"_placeholder\":true,\"num\":0}]"
+                .to_string()
+                .into_bytes()
+        );
+
+        let packet = Packet::new(
+            PacketId::BinaryEvent,
+            "/admin".to_owned(),
+            Some(
+                json!(["project:delete", {"_placeholder": true, "num": 0},{"_placeholder": true, "num": 1}]),
+            ),
+            Some(456),
+            2,
+            Some(vec![
+                Bytes::from_static(&[3, 2, 1]),
+                Bytes::from_static(&[4]),
+            ]),
+        );
+
+        assert_eq!(
+            Bytes::from(&packet),
+            "52-/admin,456[\"project:delete\",{\"_placeholder\":true,\"num\":0},{\"_placeholder\":true,\"num\":1}]"
                 .to_string()
                 .into_bytes()
         );
